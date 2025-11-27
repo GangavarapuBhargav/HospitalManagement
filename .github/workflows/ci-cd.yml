@@ -14,28 +14,15 @@ env:
 jobs:
   build-backend:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Set up JDK 17
-        uses: actions/setup-java@v4
-        with:
-          java-version: '17'
-          distribution: 'temurin'
-
-      - name: Cache Maven dependencies
-        uses: actions/cache@v3
-        with:
-          path: ~/.m2
-          key: ${{ runner.os }}-m2-${{ hashFiles('**/pom.xml') }}
-          restore-keys: ${{ runner.os }}-m2
-
-      - name: Build with Maven
-        run: mvn clean package -DskipTests
-
-      - name: Build Docker image
-        run: docker build -f Dockerfile.backend -t ${{ env.BACKEND_IMAGE }}:${{ github.sha }} -t ${{ env.BACKEND_IMAGE }}:latest .
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
 
       - name: Log in to Container Registry
         uses: docker/login-action@v3
@@ -44,36 +31,37 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Push backend image
-        run: |
-          docker tag ${{ env.BACKEND_IMAGE }}:${{ github.sha }} ${{ env.REGISTRY }}/${{ env.BACKEND_IMAGE }}:${{ github.sha }}
-          docker tag ${{ env.BACKEND_IMAGE }}:latest ${{ env.REGISTRY }}/${{ env.BACKEND_IMAGE }}:latest
-          docker push ${{ env.REGISTRY }}/${{ env.BACKEND_IMAGE }}:${{ github.sha }}
-          docker push ${{ env.REGISTRY }}/${{ env.BACKEND_IMAGE }}:latest
+      - name: Extract metadata for backend
+        id: meta-backend
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.BACKEND_IMAGE }}
+          tags: |
+            type=sha,prefix=
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Build and push backend image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          tags: ${{ steps.meta-backend.outputs.tags }}
+          labels: ${{ steps.meta-backend.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
 
   build-frontend:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Set up Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: '20'
-          cache: 'npm'
-          cache-dependency-path: frontend/package-lock.json
-
-      - name: Install dependencies
-        working-directory: ./frontend
-        run: npm ci
-
-      - name: Build frontend
-        working-directory: ./frontend
-        run: npm run build
-
-      - name: Build Docker image
-        run: docker build -f frontend/Dockerfile -t ${{ env.FRONTEND_IMAGE }}:${{ github.sha }} -t ${{ env.FRONTEND_IMAGE }}:latest ./frontend
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
 
       - name: Log in to Container Registry
         uses: docker/login-action@v3
@@ -82,12 +70,25 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Push frontend image
-        run: |
-          docker tag ${{ env.FRONTEND_IMAGE }}:${{ github.sha }} ${{ env.REGISTRY }}/${{ env.FRONTEND_IMAGE }}:${{ github.sha }}
-          docker tag ${{ env.FRONTEND_IMAGE }}:latest ${{ env.REGISTRY }}/${{ env.FRONTEND_IMAGE }}:latest
-          docker push ${{ env.REGISTRY }}/${{ env.FRONTEND_IMAGE }}:${{ github.sha }}
-          docker push ${{ env.REGISTRY }}/${{ env.FRONTEND_IMAGE }}:latest
+      - name: Extract metadata for frontend
+        id: meta-frontend
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.FRONTEND_IMAGE }}
+          tags: |
+            type=sha,prefix=
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Build and push frontend image
+        uses: docker/build-push-action@v5
+        with:
+          context: ./frontend
+          file: ./frontend/Dockerfile
+          push: true
+          tags: ${{ steps.meta-frontend.outputs.tags }}
+          labels: ${{ steps.meta-frontend.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
 
   deploy:
     needs: [build-backend, build-frontend]
@@ -104,23 +105,49 @@ jobs:
 
       - name: Configure kubectl
         run: |
-          mkdir -p $HOME/.kube
-          echo "${{ secrets.KUBE_CONFIG }}" | base64 -d > $HOME/.kube/config
-
-      - name: Update Kubernetes manifests
-        run: |
-          sed -i "s|your-registry/springboot-backend:latest|${{ env.REGISTRY }}/${{ env.BACKEND_IMAGE }}:${{ github.sha }}|g" k8s/backend-deployment.yaml
-          sed -i "s|your-registry/react-frontend:latest|${{ env.REGISTRY }}/${{ env.FRONTEND_IMAGE }}:${{ github.sha }}|g" k8s/frontend-deployment.yaml
+          echo "${{ secrets.KUBECONFIG }}" | base64 -d > kubeconfig
+          export KUBECONFIG=./kubeconfig
+          kubectl version --client
 
       - name: Deploy to Kubernetes
+        env:
+          REGISTRY: ${{ env.REGISTRY }}
+          BACKEND_IMAGE: ${{ env.REGISTRY }}/${{ env.BACKEND_IMAGE }}
+          FRONTEND_IMAGE: ${{ env.REGISTRY }}/${{ env.FRONTEND_IMAGE }}
+          IMAGE_TAG: ${{ github.sha }}
         run: |
+          export KUBECONFIG=./kubeconfig
+          
+          # Create backup of deployment files
+          cp k8s/backend-deployment.yaml k8s/backend-deployment.yaml.bak
+          cp k8s/frontend-deployment.yaml k8s/frontend-deployment.yaml.bak
+          
+          # Update deployment files with actual image names
+          sed -i "s|your-registry/springboot-backend:latest|${BACKEND_IMAGE}:${IMAGE_TAG}|g" k8s/backend-deployment.yaml
+          sed -i "s|your-registry/react-frontend:latest|${FRONTEND_IMAGE}:${IMAGE_TAG}|g" k8s/frontend-deployment.yaml
+          
+          # Apply Kubernetes manifests
+          echo "📋 Applying Kubernetes manifests..."
           kubectl apply -f k8s/namespace.yaml
           kubectl apply -f k8s/mysql-secret.yaml
           kubectl apply -f k8s/mysql-deployment.yaml
+          
+          echo "⏳ Waiting for MySQL to be ready..."
+          kubectl wait --for=condition=ready pod -l app=mysql -n hospital-app --timeout=300s || true
+          
           kubectl apply -f k8s/backend-secret.yaml
           kubectl apply -f k8s/backend-configmap.yaml
           kubectl apply -f k8s/backend-deployment.yaml
           kubectl apply -f k8s/frontend-deployment.yaml
-          kubectl rollout status deployment/backend -n hospital-app
-          kubectl rollout status deployment/frontend -n hospital-app
+          
+          echo "⏳ Waiting for deployments to be ready..."
+          kubectl rollout status deployment/backend -n hospital-app --timeout=300s || true
+          kubectl rollout status deployment/frontend -n hospital-app --timeout=300s || true
+          
+          echo "✅ Deployment complete!"
+          kubectl get all -n hospital-app
+          
+          # Restore backup files
+          mv k8s/backend-deployment.yaml.bak k8s/backend-deployment.yaml 2>/dev/null || true
+          mv k8s/frontend-deployment.yaml.bak k8s/frontend-deployment.yaml 2>/dev/null || true
 
