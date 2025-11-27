@@ -17,6 +17,9 @@ jobs:
     permissions:
       contents: read
       packages: write
+    outputs:
+      image: ${{ steps.meta-backend.outputs.tags }}
+      digest: ${{ steps.build-backend.outputs.digest }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -41,6 +44,7 @@ jobs:
             type=raw,value=latest,enable={{is_default_branch}}
 
       - name: Build and push backend image
+        id: build-backend
         uses: docker/build-push-action@v5
         with:
           context: .
@@ -51,11 +55,19 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
+      - name: Output image info
+        run: |
+          echo "Backend image tags: ${{ steps.meta-backend.outputs.tags }}"
+          echo "Backend image digest: ${{ steps.build-backend.outputs.digest }}"
+
   build-frontend:
     runs-on: ubuntu-latest
     permissions:
       contents: read
       packages: write
+    outputs:
+      image: ${{ steps.meta-frontend.outputs.tags }}
+      digest: ${{ steps.build-frontend.outputs.digest }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -80,6 +92,7 @@ jobs:
             type=raw,value=latest,enable={{is_default_branch}}
 
       - name: Build and push frontend image
+        id: build-frontend
         uses: docker/build-push-action@v5
         with:
           context: ./frontend
@@ -89,6 +102,11 @@ jobs:
           labels: ${{ steps.meta-frontend.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+      - name: Output image info
+        run: |
+          echo "Frontend image tags: ${{ steps.meta-frontend.outputs.tags }}"
+          echo "Frontend image digest: ${{ steps.build-frontend.outputs.digest }}"
 
   deploy:
     needs: [build-backend, build-frontend]
@@ -105,46 +123,82 @@ jobs:
 
       - name: Configure kubectl
         run: |
+          if [ -z "${{ secrets.KUBECONFIG }}" ]; then
+            echo "❌ KUBECONFIG secret is not set!"
+            exit 1
+          fi
           echo "${{ secrets.KUBECONFIG }}" | base64 -d > kubeconfig
           export KUBECONFIG=./kubeconfig
+          chmod 600 kubeconfig
           kubectl version --client
+          kubectl cluster-info || echo "⚠️  Warning: Could not connect to cluster"
+
+      - name: Extract image tags
+        id: extract-tags
+        run: |
+          # Extract the first tag from the comma-separated list
+          BACKEND_TAG=$(echo "${{ needs.build-backend.outputs.image }}" | cut -d',' -f1 | tr -d ' ')
+          FRONTEND_TAG=$(echo "${{ needs.build-frontend.outputs.image }}" | cut -d',' -f1 | tr -d ' ')
+          
+          # If latest tag exists, use it, otherwise use SHA tag
+          if echo "${{ needs.build-backend.outputs.image }}" | grep -q "latest"; then
+            BACKEND_TAG=$(echo "${{ needs.build-backend.outputs.image }}" | grep -o '[^,]*latest[^,]*' | head -1)
+          fi
+          if echo "${{ needs.build-frontend.outputs.image }}" | grep -q "latest"; then
+            FRONTEND_TAG=$(echo "${{ needs.build-frontend.outputs.image }}" | grep -o '[^,]*latest[^,]*' | head -1)
+          fi
+          
+          echo "backend-image=${BACKEND_TAG}" >> $GITHUB_OUTPUT
+          echo "frontend-image=${FRONTEND_TAG}" >> $GITHUB_OUTPUT
+          echo "Backend image: ${BACKEND_TAG}"
+          echo "Frontend image: ${FRONTEND_TAG}"
 
       - name: Deploy to Kubernetes
         env:
-          REGISTRY: ${{ env.REGISTRY }}
-          BACKEND_IMAGE: ${{ env.REGISTRY }}/${{ env.BACKEND_IMAGE }}
-          FRONTEND_IMAGE: ${{ env.REGISTRY }}/${{ env.FRONTEND_IMAGE }}
-          IMAGE_TAG: ${{ github.sha }}
+          KUBECONFIG: ./kubeconfig
+          BACKEND_IMAGE: ${{ steps.extract-tags.outputs.backend-image }}
+          FRONTEND_IMAGE: ${{ steps.extract-tags.outputs.frontend-image }}
         run: |
-          export KUBECONFIG=./kubeconfig
+          set -e
+          
+          echo "📋 Deploying with images:"
+          echo "  Backend: ${BACKEND_IMAGE}"
+          echo "  Frontend: ${FRONTEND_IMAGE}"
           
           # Create backup of deployment files
           cp k8s/backend-deployment.yaml k8s/backend-deployment.yaml.bak
           cp k8s/frontend-deployment.yaml k8s/frontend-deployment.yaml.bak
           
-          # Update deployment files with actual image names
-          sed -i "s|your-registry/springboot-backend:latest|${BACKEND_IMAGE}:${IMAGE_TAG}|g" k8s/backend-deployment.yaml
-          sed -i "s|your-registry/react-frontend:latest|${FRONTEND_IMAGE}:${IMAGE_TAG}|g" k8s/frontend-deployment.yaml
+          # Update deployment files with actual image names (Linux sed syntax)
+          sed -i "s|your-registry/springboot-backend:latest|${BACKEND_IMAGE}|g" k8s/backend-deployment.yaml
+          sed -i "s|your-registry/react-frontend:latest|${FRONTEND_IMAGE}|g" k8s/frontend-deployment.yaml
+          
+          # Verify the replacement worked
+          echo "📝 Updated deployment files:"
+          grep "image:" k8s/backend-deployment.yaml || echo "⚠️  Backend image not found in deployment file"
+          grep "image:" k8s/frontend-deployment.yaml || echo "⚠️  Frontend image not found in deployment file"
           
           # Apply Kubernetes manifests
           echo "📋 Applying Kubernetes manifests..."
-          kubectl apply -f k8s/namespace.yaml
-          kubectl apply -f k8s/mysql-secret.yaml
+          kubectl apply -f k8s/namespace.yaml || echo "⚠️  Namespace may already exist"
+          kubectl apply -f k8s/mysql-secret.yaml || echo "⚠️  MySQL secret may already exist"
           kubectl apply -f k8s/mysql-deployment.yaml
           
           echo "⏳ Waiting for MySQL to be ready..."
-          kubectl wait --for=condition=ready pod -l app=mysql -n hospital-app --timeout=300s || true
+          kubectl wait --for=condition=ready pod -l app=mysql -n hospital-app --timeout=300s || echo "⚠️  MySQL not ready, continuing..."
           
-          kubectl apply -f k8s/backend-secret.yaml
-          kubectl apply -f k8s/backend-configmap.yaml
+          kubectl apply -f k8s/backend-secret.yaml || echo "⚠️  Backend secret may already exist"
+          kubectl apply -f k8s/backend-configmap.yaml || echo "⚠️  Backend configmap may already exist"
           kubectl apply -f k8s/backend-deployment.yaml
           kubectl apply -f k8s/frontend-deployment.yaml
           
           echo "⏳ Waiting for deployments to be ready..."
-          kubectl rollout status deployment/backend -n hospital-app --timeout=300s || true
-          kubectl rollout status deployment/frontend -n hospital-app --timeout=300s || true
+          kubectl rollout status deployment/backend -n hospital-app --timeout=300s || echo "⚠️  Backend deployment timeout"
+          kubectl rollout status deployment/frontend -n hospital-app --timeout=300s || echo "⚠️  Frontend deployment timeout"
           
           echo "✅ Deployment complete!"
+          echo ""
+          echo "📊 Current status:"
           kubectl get all -n hospital-app
           
           # Restore backup files
