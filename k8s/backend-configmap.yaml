@@ -1,0 +1,12 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: backend-config
+  namespace: hospital-app
+data:
+  SPRING_DATASOURCE_URL: "jdbc:mysql://mysql-service:3306/hospi?useSSL=false&allowPublicKeyRetrieval=true"
+  SPRING_DATASOURCE_DRIVER_CLASS_NAME: "com.mysql.cj.jdbc.Driver"
+  SERVER_PORT: "8081"
+  SPRING_JPA_HIBERNATE_DDL_AUTO: "update"
+  SPRING_JPA_SHOW_SQL: "true"
+

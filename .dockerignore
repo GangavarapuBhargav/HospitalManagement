@@ -1,0 +1,35 @@
+# Maven
+target/
+.mvn/
+mvnw
+mvnw.cmd
+
+# IDE
+.idea/
+.vscode/
+*.iml
+*.ipr
+*.iws
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Git
+.git/
+.gitignore
+
+# Documentation
+*.md
+README*
+
+# Kubernetes
+k8s/
+
+# Frontend (not needed for backend build)
+frontend/
+
+# Other
+*.log
+.env
+.env.local
